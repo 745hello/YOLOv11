@@ -9,7 +9,7 @@ from pathlib import Path
 
 import torch
 import torch.nn as nn
-
+from ultralytics.nn.modules import DCAF, FDSG, DetectGLR
 from ultralytics.nn.autobackend import check_class_names
 from ultralytics.nn.modules import (
     AIFI,
@@ -154,33 +154,46 @@ class BaseModel(torch.nn.Module):
         return self._predict_once(x, profile, visualize, embed)
 
     def _predict_once(self, x, profile=False, visualize=False, embed=None):
-        """Perform a forward pass through the network.
-
-        Args:
-            x (torch.Tensor): The input tensor to the model.
-            profile (bool): Print the computation time of each layer if True.
-            visualize (bool): Save the feature maps of the model if True.
-            embed (list, optional): A list of feature vectors/embeddings to return.
-
-        Returns:
-            (torch.Tensor): The last output of the model.
-        """
-        y, dt, embeddings = [], [], []  # outputs
+        """Perform a forward pass through the network once."""
+        y, dt, embeddings = [], [], []
         embed = frozenset(embed) if embed is not None else {-1}
         max_idx = max(embed)
+
         for m in self.model:
             if m.f != -1:  # if not from previous layer
-                x = y[m.f] if isinstance(m.f, int) else [x if j == -1 else y[j] for j in m.f]  # from earlier layers
+                x = y[m.f] if isinstance(m.f, int) else [x if j == -1 else y[j] for j in m.f]
+
             if profile:
                 self._profile_one_layer(m, x, dt)
-            x = m(x)  # run
-            y.append(x if m.i in self.save else None)  # save output
+
+            # ---- 关键：多输入模块分发 ----
+            if isinstance(x, list):
+                if isinstance(m, Concat):
+                    x = m(x)
+                elif isinstance(m, DCAF):
+                    assert len(x) == 3, f"DCAF expects 3 inputs, got {len(x)}"
+                    x = m(x[0], x[1], x[2])
+                elif isinstance(m, (
+                Detect, WorldDetect, YOLOEDetect, Segment, YOLOESegment, Pose, OBB, v10Detect, DetectGLR)):
+                    # Detect及其子类 forward 期望单个参数x(list)
+                    x = m(x)
+                else:
+                    x = m(*x)
+            else:
+                x = m(x)
+
+            # ---------------------------
+
+            y.append(x if m.i in self.save else None)
+
             if visualize:
                 feature_visualization(x, m.type, m.i, save_dir=visualize)
+
             if m.i in embed:
-                embeddings.append(torch.nn.functional.adaptive_avg_pool2d(x, (1, 1)).squeeze(-1).squeeze(-1))  # flatten
+                embeddings.append(torch.nn.functional.adaptive_avg_pool2d(x, (1, 1)).squeeze(-1).squeeze(-1))
                 if m.i == max_idx:
                     return torch.unbind(torch.cat(embeddings, 1), dim=0)
+
         return x
 
     def _predict_augment(self, x):
@@ -1481,19 +1494,8 @@ def load_checkpoint(weight, device=None, inplace=True, fuse=False):
     # Return model and ckpt
     return model, ckpt
 
-
 def parse_model(d, ch, verbose=True):
-    """Parse a YOLO model.yaml dictionary into a PyTorch model.
-
-    Args:
-        d (dict): Model dictionary.
-        ch (int): Input channels.
-        verbose (bool): Whether to print model details.
-
-    Returns:
-        model (torch.nn.Sequential): PyTorch model.
-        save (list): Sorted list of output layers.
-    """
+    """Parse a YOLO model.yaml dictionary into a PyTorch model."""
     import ast
 
     # Args
@@ -1509,156 +1511,152 @@ def parse_model(d, ch, verbose=True):
         depth, width, max_channels = scales[scale]
 
     if act:
-        Conv.default_act = eval(act)  # redefine default activation, i.e. Conv.default_act = torch.nn.SiLU()
+        Conv.default_act = eval(act)
         if verbose:
-            LOGGER.info(f"{colorstr('activation:')} {act}")  # print
+            LOGGER.info(f"{colorstr('activation:')} {act}")
 
     if verbose:
         LOGGER.info(f"\n{'':>3}{'from':>20}{'n':>3}{'params':>10}  {'module':<45}{'arguments':<30}")
+
     ch = [ch]
-    layers, save, c2 = [], [], ch[-1]  # layers, savelist, ch out
+
+    def get_ch(fi):
+        """Return input channels for a layer 'from' spec (int or list)."""
+        if isinstance(fi, int):
+            return ch[fi]
+        return sum(ch[j] for j in fi)
+
+    layers, save, c2 = [], [], ch[-1]
     base_modules = frozenset(
         {
-            Classify,
-            Conv,
-            ConvTranspose,
-            GhostConv,
-            Bottleneck,
-            GhostBottleneck,
-            SPP,
-            SPPF,
-            C2fPSA,
-            C2PSA,
-            DWConv,
-            Focus,
-            BottleneckCSP,
-            C1,
-            C2,
-            C2f,
-            C3k2,
-            RepNCSPELAN4,
-            ELAN1,
-            ADown,
-            AConv,
-            SPPELAN,
-            C2fAttn,
-            C3,
-            C3TR,
-            C3Ghost,
-            torch.nn.ConvTranspose2d,
-            DWConvTranspose2d,
-            C3x,
-            RepC3,
-            PSA,
-            SCDown,
-            C2fCIB,
-            A2C2f,
+            Classify, Conv, ConvTranspose, GhostConv, Bottleneck, GhostBottleneck, SPP, SPPF,
+            C2fPSA, C2PSA, DWConv, Focus, BottleneckCSP, C1, C2, C2f, C3k2, RepNCSPELAN4, ELAN1,
+            ADown, AConv, SPPELAN, C2fAttn, C3, C3TR, C3Ghost, torch.nn.ConvTranspose2d,
+            DWConvTranspose2d, C3x, RepC3, PSA, SCDown, C2fCIB, A2C2f,
         }
     )
-    repeat_modules = frozenset(  # modules with 'repeat' arguments
+    repeat_modules = frozenset(
         {
-            BottleneckCSP,
-            C1,
-            C2,
-            C2f,
-            C3k2,
-            C2fAttn,
-            C3,
-            C3TR,
-            C3Ghost,
-            C3x,
-            RepC3,
-            C2fPSA,
-            C2fCIB,
-            C2PSA,
-            A2C2f,
+            BottleneckCSP, C1, C2, C2f, C3k2, C2fAttn, C3, C3TR, C3Ghost, C3x,
+            RepC3, C2fPSA, C2fCIB, C2PSA, A2C2f,
         }
     )
-    for i, (f, n, m, args) in enumerate(d["backbone"] + d["head"]):  # from, number, module, args
+
+    for i, (f, n, m, args) in enumerate(d["backbone"] + d["head"]):
         m = (
             getattr(torch.nn, m[3:])
             if "nn." in m
             else getattr(__import__("torchvision").ops, m[16:])
             if "torchvision.ops." in m
             else globals()[m]
-        )  # get module
+        )
+
         for j, a in enumerate(args):
             if isinstance(a, str):
                 with contextlib.suppress(ValueError):
                     args[j] = locals()[a] if a in locals() else ast.literal_eval(a)
-        n = n_ = max(round(n * depth), 1) if n > 1 else n  # depth gain
+
+        n = n_ = max(round(n * depth), 1) if n > 1 else n
+
         if m in base_modules:
-            c1, c2 = ch[f], args[0]
-            if c2 != nc:  # if c2 not equal to number of classes (i.e. for Classify() output)
+            c1, c2 = get_ch(f), args[0]
+            if c2 != nc:
                 c2 = make_divisible(min(c2, max_channels) * width, 8)
-            if m is C2fAttn:  # set 1) embed channels and 2) num heads
+
+            if m is C2fAttn:
                 args[1] = make_divisible(min(args[1], max_channels // 2) * width, 8)
                 args[2] = int(max(round(min(args[2], max_channels // 2 // 32)) * width, 1) if args[2] > 1 else args[2])
 
             args = [c1, c2, *args[1:]]
             if m in repeat_modules:
-                args.insert(2, n)  # number of repeats
+                args.insert(2, n)
                 n = 1
-            if m is C3k2:  # for M/L/X sizes
+
+            if m is C3k2:
                 legacy = False
                 if scale in "mlx":
                     args[3] = True
             if m is A2C2f:
                 legacy = False
-                if scale in "lx":  # for L/X sizes
+                if scale in "lx":
                     args.extend((True, 1.2))
             if m is C2fCIB:
                 legacy = False
+
         elif m is AIFI:
-            args = [ch[f], *args]
-        elif m in frozenset({HGStem, HGBlock}):
-            c1, cm, c2 = ch[f], args[0], args[1]
+            args = [get_ch(f), *args]
+
+        elif m in {HGStem, HGBlock}:
+            c1, cm, c2 = get_ch(f), args[0], args[1]
             args = [c1, cm, c2, *args[2:]]
             if m is HGBlock:
-                args.insert(4, n)  # number of repeats
+                args.insert(4, n)
                 n = 1
+
         elif m is ResNetLayer:
             c2 = args[1] if args[3] else args[1] * 4
+
         elif m is torch.nn.BatchNorm2d:
-            args = [ch[f]]
+            c2 = get_ch(f)
+            args = [c2]
+
         elif m is Concat:
             c2 = sum(ch[x] for x in f)
-        elif m in frozenset(
-            {Detect, WorldDetect, YOLOEDetect, Segment, YOLOESegment, Pose, OBB, ImagePoolingAttn, v10Detect}
-        ):
+
+        elif m is DCAF:
+            # YAML: DCAF, [c_out], f should be a 3-branch list [low, cur, high]
+            if not isinstance(f, (list, tuple)) or len(f) != 3:
+                raise ValueError(f"DCAF expects 3 input branches in 'from', but got f={f}")
+            c2 = args[0]
+            c_low, c_cur, c_high = (ch[x] for x in f)
+            args = [c2, c_low, c_cur, c_high]
+
+        elif m is FDSG:
+            # YAML: FDSG, [c_out, level]
+            c2 = args[0]
+            args = [*args]
+
+        elif m in {Detect, WorldDetect, YOLOEDetect, Segment, YOLOESegment, Pose, OBB, ImagePoolingAttn, v10Detect, DetectGLR}:
             args.append([ch[x] for x in f])
-            if m is Segment or m is YOLOESegment:
+            c2 = sum(ch[x] for x in f)  # 仅用于通道账本占位，检测头后面通常无继续主干卷积
+            if m in {Segment, YOLOESegment}:
                 args[2] = make_divisible(min(args[2], max_channels) * width, 8)
-            if m in {Detect, YOLOEDetect, Segment, YOLOESegment, Pose, OBB}:
+            if m in {Detect, YOLOEDetect, Segment, YOLOESegment, Pose, OBB, DetectGLR}:
                 m.legacy = legacy
-        elif m is RTDETRDecoder:  # special case, channels arg must be passed in index 1
+
+        elif m is RTDETRDecoder:
             args.insert(1, [ch[x] for x in f])
+            c2 = args[0] if len(args) else get_ch(f)
+
         elif m is CBLinear:
             c2 = args[0]
-            c1 = ch[f]
+            c1 = get_ch(f)
             args = [c1, c2, *args[1:]]
+
         elif m is CBFuse:
             c2 = ch[f[-1]]
-        elif m in frozenset({TorchVision, Index}):
-            c2 = args[0]
-            c1 = ch[f]
-            args = [*args[1:]]
-        else:
-            c2 = ch[f]
 
-        m_ = torch.nn.Sequential(*(m(*args) for _ in range(n))) if n > 1 else m(*args)  # module
-        t = str(m)[8:-2].replace("__main__.", "")  # module type
-        m_.np = sum(x.numel() for x in m_.parameters())  # number params
-        m_.i, m_.f, m_.type = i, f, t  # attach index, 'from' index, type
+        elif m in {TorchVision, Index}:
+            c2 = args[0]
+            args = [*args[1:]]
+
+        else:
+            c2 = get_ch(f)
+
+        m_ = torch.nn.Sequential(*(m(*args) for _ in range(n))) if n > 1 else m(*args)
+        t = str(m)[8:-2].replace("__main__.", "")
+        m_.np = sum(x.numel() for x in m_.parameters())
+        m_.i, m_.f, m_.type = i, f, t
         if verbose:
-            LOGGER.info(f"{i:>3}{f!s:>20}{n_:>3}{m_.np:10.0f}  {t:<45}{args!s:<30}")  # print
-        save.extend(x % i for x in ([f] if isinstance(f, int) else f) if x != -1)  # append to savelist
+            LOGGER.info(f"{i:>3}{f!s:>20}{n_:>3}{m_.np:10.0f}  {t:<45}{args!s:<30}")
+
+        save.extend(x % i for x in ([f] if isinstance(f, int) else f) if x != -1)
         layers.append(m_)
         if i == 0:
             ch = []
         ch.append(c2)
-    return torch.nn.Sequential(*layers), sorted(save)
 
+    return torch.nn.Sequential(*layers), sorted(save)
 
 def yaml_model_load(path):
     """Load a YOLOv8 model from a YAML file.

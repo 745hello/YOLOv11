@@ -17,6 +17,7 @@ Examples:
     >>> subprocess.run(f"onnxslim {f} {f} && open {f}", shell=True, check=True)  # pip install onnxslim
 """
 
+from .dcaf_fdsg_glr import DCAF, FDSG, DetectGLR
 from .block import (
     C1,
     C2,

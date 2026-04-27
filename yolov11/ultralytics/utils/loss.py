@@ -213,6 +213,7 @@ class v8DetectionLoss:
         self.assigner = TaskAlignedAssigner(topk=tal_topk, num_classes=self.nc, alpha=0.5, beta=6.0)
         self.bbox_loss = BboxLoss(m.reg_max).to(device)
         self.proj = torch.arange(m.reg_max, dtype=torch.float, device=device)
+        self.model = model
 
     def preprocess(self, targets: torch.Tensor, batch_size: int, scale_tensor: torch.Tensor) -> torch.Tensor:
         """Preprocess targets by converting to tensor format and scaling coordinates."""
@@ -244,17 +245,56 @@ class v8DetectionLoss:
         """Calculate the sum of the loss for box, cls and dfl multiplied by batch size."""
         loss = torch.zeros(3, device=self.device)  # box, cls, dfl
         feats = preds[1] if isinstance(preds, tuple) else preds
-        pred_distri, pred_scores = torch.cat([xi.view(feats[0].shape[0], self.no, -1) for xi in feats], 2).split(
-            (self.reg_max * 4, self.nc), 1
-        )
 
-        pred_scores = pred_scores.permute(0, 2, 1).contiguous()
-        pred_distri = pred_distri.permute(0, 2, 1).contiguous()
+        dtype = feats[0].dtype
+        batch_size = feats[0].shape[0]
 
-        dtype = pred_scores.dtype
-        batch_size = pred_scores.shape[0]
-        imgsz = torch.tensor(feats[0].shape[2:], device=self.device, dtype=dtype) * self.stride[0]  # image size (h,w)
-        anchor_points, stride_tensor = make_anchors(feats, self.stride, 0.5)
+        # -----------------------------
+        # 1) Split per-level predictions
+        # feats[i]: [B, no, Hi, Wi] OR [B, C, Hi, Wi] depending on head implementation
+        # Ultralytics Detect returns list of tensors [B, no, Hi, Wi]
+        # -----------------------------
+        nl = len(feats)
+        pred_scores_l = []
+        pred_distri_l = []
+        anchors_l = []
+        stride_l = []
+        hw_l = []
+
+        # build anchors (same as your code)
+        anchor_points, stride_tensor = make_anchors(feats, self.stride, 0.5)  # [A,2], [A,1]
+        # image size
+        imgsz = torch.tensor(feats[0].shape[2:], device=self.device, dtype=dtype) * self.stride[0]
+
+        # flatten each level
+        start = 0
+        for i, xi in enumerate(feats):
+            # xi -> [B, no, Hi*Wi]
+            b, c, h, w = xi.shape
+            hw = h * w
+            hw_l.append(hw)
+            xif = xi.view(b, self.no, -1)
+            pd, ps = xif.split((self.reg_max * 4, self.nc), 1)  # [B, reg, hw], [B, nc, hw]
+
+            # permute to [B, hw, ...]
+            pd = pd.permute(0, 2, 1).contiguous()
+            ps = ps.permute(0, 2, 1).contiguous()
+
+            pred_distri_l.append(pd)  # [B, hw, reg_max*4]
+            pred_scores_l.append(ps)  # [B, hw, nc]
+
+            # slice anchors/stride for this level
+            ap = anchor_points[start:start + hw]
+            st = stride_tensor[start:start + hw]
+            anchors_l.append(ap)
+            stride_l.append(st)
+            start += hw
+
+        # concat for assigner (keep same behavior)
+        pred_scores_all = torch.cat(pred_scores_l, dim=1)  # [B, A, nc]
+        pred_distri_all = torch.cat(pred_distri_l, dim=1)  # [B, A, reg]
+        anchors_all = anchor_points
+        stride_all = stride_tensor
 
         # Targets
         targets = torch.cat((batch["batch_idx"].view(-1, 1), batch["cls"].view(-1, 1), batch["bboxes"]), 1)
@@ -262,44 +302,99 @@ class v8DetectionLoss:
         gt_labels, gt_bboxes = targets.split((1, 4), 2)  # cls, xyxy
         mask_gt = gt_bboxes.sum(2, keepdim=True).gt_(0.0)
 
-        # Pboxes
-        pred_bboxes = self.bbox_decode(anchor_points, pred_distri)  # xyxy, (b, h*w, 4)
-        # dfl_conf = pred_distri.view(batch_size, -1, 4, self.reg_max).detach().softmax(-1)
-        # dfl_conf = (dfl_conf.amax(-1).mean(-1) + dfl_conf.amax(-1).amin(-1)) / 2
+        # Decode bboxes for assigner (need all anchors)
+        pred_bboxes_all = self.bbox_decode(anchors_all, pred_distri_all)  # [B, A, 4] xyxy
 
         _, target_bboxes, target_scores, fg_mask, _ = self.assigner(
-            # pred_scores.detach().sigmoid() * 0.8 + dfl_conf.unsqueeze(-1) * 0.2,
-            pred_scores.detach().sigmoid(),
-            (pred_bboxes.detach() * stride_tensor).type(gt_bboxes.dtype),
-            anchor_points * stride_tensor,
+            pred_scores_all.detach().sigmoid(),
+            (pred_bboxes_all.detach() * stride_all).type(gt_bboxes.dtype),
+            anchors_all * stride_all,
             gt_labels,
             gt_bboxes,
             mask_gt,
         )
-
         target_scores_sum = max(target_scores.sum(), 1)
 
-        # Cls loss
-        # loss[1] = self.varifocal_loss(pred_scores, target_scores, target_labels) / target_scores_sum  # VFL way
-        loss[1] = self.bce(pred_scores, target_scores.to(dtype)).sum() / target_scores_sum  # BCE
+        # -----------------------------
+        # 2) GLR weights (if head supports it)
+        # -----------------------------
+        m = self.model.model[-1]
+        use_glr = hasattr(m, "glr_weights") and hasattr(m, "update_glr")
+        if use_glr:
+            a_cls, a_box = m.glr_weights()  # shape [nl]
+            a_cls = a_cls.to(self.device)
+            a_box = a_box.to(self.device)
+        else:
+            a_cls = torch.ones(nl, device=self.device)
+            a_box = torch.ones(nl, device=self.device)
 
-        # Bbox loss
-        if fg_mask.sum():
-            loss[0], loss[2] = self.bbox_loss(
-                pred_distri,
-                pred_bboxes,
-                anchor_points,
-                target_bboxes / stride_tensor,
-                target_scores,
-                target_scores_sum,
-                fg_mask,
-            )
+        # -----------------------------
+        # 3) Per-level loss compute
+        # -----------------------------
+        # split targets back to per-level slices
+        lbox_list, lcls_list, ldfl_list = [], [], []
 
-        loss[0] *= self.hyp.box  # box gain
-        loss[1] *= self.hyp.cls  # cls gain
-        loss[2] *= self.hyp.dfl  # dfl gain
+        start = 0
+        for i in range(nl):
+            hw = hw_l[i]
+            end = start + hw
 
-        return loss * batch_size, loss.detach()  # loss(box, cls, dfl)
+            ps = pred_scores_all[:, start:end, :]  # [B, hw, nc]
+            pd = pred_distri_all[:, start:end, :]  # [B, hw, reg]
+            ap = anchors_all[start:end]  # [hw, 2]
+            st = stride_all[start:end]  # [hw, 1]
+
+            tbox = target_bboxes[:, start:end, :]  # [B, hw, 4]
+            tsco = target_scores[:, start:end, :]  # [B, hw, nc]
+            fgm = fg_mask[:, start:end]  # [B, hw]
+
+            # cls (per-level)
+            lcls_i = self.bce(ps, tsco.to(dtype)).sum() / target_scores_sum
+
+            # box/dfl (per-level)
+            if fgm.sum():
+                lbox_i, ldfl_i = self.bbox_loss(
+                    pd,
+                    self.bbox_decode(ap, pd),  # decode only this level
+                    ap,
+                    tbox / st,
+                    tsco,
+                    target_scores_sum,
+                    fgm,
+                )
+            else:
+                lbox_i = torch.zeros(1, device=self.device, dtype=dtype).squeeze()
+                ldfl_i = torch.zeros(1, device=self.device, dtype=dtype).squeeze()
+
+            lbox_list.append(lbox_i)
+            lcls_list.append(lcls_i)
+            ldfl_list.append(ldfl_i)
+
+            start = end
+
+        # -----------------------------
+        # 4) Apply GLR weights and hyp gains
+        # -----------------------------
+        # weighted sum across levels
+        loss_box = torch.stack([a_box[i] * lbox_list[i] for i in range(nl)]).sum()
+        loss_cls = torch.stack([a_cls[i] * lcls_list[i] for i in range(nl)]).sum()
+        loss_dfl = torch.stack([a_box[i] * ldfl_list[i] for i in range(nl)]).sum()
+
+        loss[0] = loss_box * self.hyp.box
+        loss[1] = loss_cls * self.hyp.cls
+        loss[2] = loss_dfl * self.hyp.dfl
+
+        # -----------------------------
+        # 5) Update GLR EMA (use loss magnitude as grad proxy)
+        # -----------------------------
+        if use_glr:
+            with torch.no_grad():
+                g_cls = torch.stack([x.detach() for x in lcls_list]).to(self.device)  # [nl]
+                g_box = torch.stack([(lbox_list[i].detach() + ldfl_list[i].detach()) for i in range(nl)]).to(
+                    self.device)
+                m.update_glr(g_cls, g_box)
+
+        return loss * batch_size, loss.detach()
 
 
 class v8SegmentationLoss(v8DetectionLoss):

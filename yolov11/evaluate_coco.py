@@ -7,7 +7,7 @@ from pycocotools.cocoeval import COCOeval
 
 # ========== 请在这里直接指定文件路径 ==========
 GT_JSON = "../.././DATASETS/COCO2017/annotations/instances_val2017.json"        # COCO格式 ground truth
-PRED_JSON = "./../yolov11/runs/detect/train/predictions.json"  # YOLO模型输出的预测json
+PRED_JSON = "./../improve1/runs/detect/train2/predictions.json"  # YOLO模型输出的预测json
 OUT_JSON = "./runs/detect/train/predictions_coco_eval_ready.json"      # 输出json（会写入来源信息）
 
 # ========== 推理参数（写入输出文件用于追溯） ==========
