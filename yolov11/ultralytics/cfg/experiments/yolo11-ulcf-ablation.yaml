@@ -1,0 +1,68 @@
+# Ultralytics 🚀 AGPL-3.0 License - https://ultralytics.com/license
+# Unified ablation experiment structure for YOLO11 ULCF
+
+meta:
+  task: detect
+  objective: isolate contributions of DCAF, FDSG and DetectGLR
+  primary_metric: metrics/mAP50-95(B)
+  secondary_metrics: [metrics/mAP50(B), model/params, model/FLOPs, speed/inference]
+  seeds: [0, 1, 2]
+  report: mean_std
+
+controls:
+  keep_constant:
+    - data
+    - imgsz
+    - epochs
+    - batch
+    - optimizer
+    - augmentations
+    - device
+    - validation_nms
+
+stage_a_screening:
+  epochs: 50
+  groups: [g0, g1, g2, g3, g4, g5, g6, g7]
+
+stage_b_full:
+  epochs: 300
+  groups: [g0, g1, g2, g3, g4]
+  optional_groups: [g5, g6, g7]
+
+stage_c_report:
+  epochs: 300
+  groups: [g4]
+  sensitivity_groups: [s1, s2, s3, s4]
+
+models:
+  g0: ultralytics/cfg/models/11/ablation/yolo11-ablation-g0-baseline.yaml
+  g1: ultralytics/cfg/models/11/ablation/yolo11-ablation-g1-dcaf.yaml
+  g2: ultralytics/cfg/models/11/ablation/yolo11-ablation-g2-fdsg.yaml
+  g3: ultralytics/cfg/models/11/ablation/yolo11-ablation-g3-detectglr.yaml
+  g4: ultralytics/cfg/models/11/ablation/yolo11-ablation-g4-dcaf-fdsg-detectglr.yaml
+  g5: ultralytics/cfg/models/11/ablation/yolo11-ablation-g5-dcaf-fdsg.yaml
+  g6: ultralytics/cfg/models/11/ablation/yolo11-ablation-g6-dcaf-detectglr.yaml
+  g7: ultralytics/cfg/models/11/ablation/yolo11-ablation-g7-fdsg-detectglr.yaml
+
+sensitivity:
+  s1: ultralytics/cfg/models/11/ablation/yolo11-ablation-s1-channels-conservative.yaml
+  s2: ultralytics/cfg/models/11/ablation/yolo11-ablation-s2-channels-aggressive.yaml
+  s3: ultralytics/cfg/models/11/ablation/yolo11-ablation-s3-fdsg-levels-alt.yaml
+  s4: ultralytics/cfg/models/11/ablation/yolo11-ablation-s4-dcaf-inputs-alt.yaml
+
+execution_example:
+  train: >-
+    yolo task=detect mode=train model={model}
+    data={data}
+    epochs={epochs}
+    batch={batch}
+    imgsz={imgsz}
+    seed={seed}
+    project={project}
+    name={group}_seed{seed}
+    save_json=True
+  val: >-
+    yolo task=detect mode=val model={best_pt}
+    data={data}
+    split=val
+    save_json=True
