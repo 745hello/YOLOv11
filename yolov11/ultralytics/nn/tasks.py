@@ -1616,8 +1616,8 @@ def parse_model(d, ch, verbose=True):
             if len(args) < 2:
                 raise ValueError(f"FDSG expects args [c_out, level], but got args={args}")
             c2 = make_divisible(min(args[0], max_channels) * width, 8)
-            level, extra_args = args[1], args[2:]
-            args = [c2, level, *extra_args]
+            fdsg_level, extra_args = args[1], args[2:]
+            args = [c2, fdsg_level, *extra_args]
 
         elif m in {Detect, WorldDetect, YOLOEDetect, Segment, YOLOESegment, Pose, OBB, ImagePoolingAttn, v10Detect, DetectGLR}:
             args.append([ch[x] for x in f])
