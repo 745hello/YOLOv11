@@ -1607,14 +1607,14 @@ def parse_model(d, ch, verbose=True):
             # YAML: DCAF, [c_out], f should be a 3-branch list [low, cur, high]
             if not isinstance(f, (list, tuple)) or len(f) != 3:
                 raise ValueError(f"DCAF expects 3 input branches in 'from', but got f={f}")
-            c2 = args[0]
+            c2 = make_divisible(min(args[0], max_channels) * width, 8)
             c_low, c_cur, c_high = (ch[x] for x in f)
             args = [c2, c_low, c_cur, c_high]
 
         elif m is FDSG:
             # YAML: FDSG, [c_out, level]
-            c2 = args[0]
-            args = [*args]
+            c2 = make_divisible(min(args[0], max_channels) * width, 8)
+            args = [c2, *args[1:]]
 
         elif m in {Detect, WorldDetect, YOLOEDetect, Segment, YOLOESegment, Pose, OBB, ImagePoolingAttn, v10Detect, DetectGLR}:
             args.append([ch[x] for x in f])
