@@ -4,7 +4,7 @@
 
 已在以下目录提供可直接使用的消融模型配置：
 
-- `/home/runner/work/yolov11/yolov11/yolov11/ultralytics/cfg/models/11/ablation`
+- `ultralytics/cfg/models/11/ablation`
 
 分组如下：
 
@@ -26,7 +26,7 @@
 
 统一实验结构配置：
 
-- `/home/runner/work/yolov11/yolov11/yolov11/ultralytics/cfg/experiments/yolo11-ulcf-ablation.yaml`
+- `ultralytics/cfg/experiments/yolo11-ulcf-ablation.yaml`
 
 该配置定义了：
 
@@ -38,7 +38,7 @@
 ## 运行示例
 
 ```bash
-cd /home/runner/work/yolov11/yolov11/yolov11
+cd yolov11
 
 yolo task=detect mode=train \
   model=ultralytics/cfg/models/11/ablation/yolo11-ablation-g0-baseline.yaml \

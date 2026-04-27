@@ -51,6 +51,13 @@ sensitivity:
   s4: ultralytics/cfg/models/11/ablation/yolo11-ablation-s4-dcaf-inputs-alt.yaml
 
 execution_example:
+  # Replace placeholders with actual values:
+  # - {model}: one of paths from `models` or `sensitivity`
+  # - {data}: dataset yaml path
+  # - {epochs}/{batch}/{imgsz}: fixed training settings for fair comparison
+  # - {seed}: one value from meta.seeds
+  # - {project}: output root dir
+  # - {best_pt}: checkpoint path for validation
   train: >-
     yolo task=detect mode=train model={model}
     data={data}
